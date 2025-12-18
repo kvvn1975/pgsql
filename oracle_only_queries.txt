@@ -1,0 +1,113 @@
+
+ORACLE-ONLY SQL QUERIES (Will NOT work in PostgreSQL)
+====================================================
+
+SCHEMAS USED: BANKING, HRMS, SALES
+
+--------------------------------
+BANKING DOMAIN
+--------------------------------
+
+1) Using DUAL (Oracle-only table)
+--------------------------------
+SELECT COUNT(*) AS total_customers
+FROM banking.customers
+WHERE EXISTS (SELECT 1 FROM dual);
+
+2) Using ROWNUM for limiting rows
+--------------------------------
+SELECT *
+FROM (
+  SELECT t.*
+  FROM banking.transactions t
+  ORDER BY t.txn_date DESC
+)
+WHERE ROWNUM <= 10;
+
+3) Old-style outer join operator (+)
+------------------------------------
+SELECT a.account_id, a.customer_id, t.txn_id, t.amount
+FROM banking.accounts a, banking.transactions t
+WHERE a.account_id = t.account_id(+)
+  AND t.txn_date(+) >= SYSDATE - 60;
+
+4) SYS_GUID() function
+----------------------
+SELECT SYS_GUID() AS generated_guid
+FROM dual;
+
+--------------------------------
+HRMS DOMAIN
+--------------------------------
+
+5) DECODE (Oracle-only)
+----------------------
+SELECT e.emp_id,
+       e.emp_name,
+       DECODE(e.department_id, 10, 'IT', 20, 'HR', 'OTHER') AS dept_name
+FROM hrms.employees e;
+
+6) NVL2 function
+----------------
+SELECT e.emp_id,
+       NVL2(e.manager_id, 'HAS_MANAGER', 'NO_MANAGER') AS manager_flag
+FROM hrms.employees e;
+
+7) KEEP (DENSE_RANK LAST ...) analytic extension
+------------------------------------------------
+SELECT e.department_id,
+       MAX(e.emp_name) KEEP (DENSE_RANK LAST ORDER BY e.salary) AS top_earner,
+       MAX(e.salary)   KEEP (DENSE_RANK LAST ORDER BY e.salary) AS top_salary
+FROM hrms.employees e
+GROUP BY e.department_id;
+
+--------------------------------
+SALES DOMAIN
+--------------------------------
+
+8) PIVOT clause (Oracle native)
+-------------------------------
+SELECT *
+FROM (
+  SELECT TO_CHAR(o.order_date, 'YYYY-MM') AS ym,
+         (oi.qty * p.price) AS revenue
+  FROM sales.orders o
+  JOIN sales.order_items oi ON oi.order_id = o.order_id
+  JOIN sales.products p     ON p.product_id = oi.product_id
+)
+PIVOT (
+  SUM(revenue)
+  FOR ym IN ('2025-10' AS OCT_2025, '2025-11' AS NOV_2025, '2025-12' AS DEC_2025)
+);
+
+9) MERGE statement (Oracle-style UPSERT)
+----------------------------------------
+MERGE INTO sales.products p
+USING (
+  SELECT 101 AS product_id,
+         'Updated Name' AS product_name,
+         999 AS price
+  FROM dual
+) s
+ON (p.product_id = s.product_id)
+WHEN MATCHED THEN
+  UPDATE SET p.product_name = s.product_name,
+             p.price = s.price
+WHEN NOT MATCHED THEN
+  INSERT (product_id, product_name, price)
+  VALUES (s.product_id, s.product_name, s.price);
+
+
+
+10) Optimizer hint
+------------------
+SELECT /*+ INDEX(t idx_transactions_account_date) */ *
+FROM banking.transactions t
+WHERE t.account_id = 1001;
+
+11) Flashback Query (if enabled)
+--------------------------------
+SELECT *
+FROM banking.accounts
+AS OF TIMESTAMP (SYSTIMESTAMP - INTERVAL '10' MINUTE);
+
