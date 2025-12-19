@@ -1,0 +1,247 @@
+ORACLE → POSTGRES MIGRATION PRACTICE QUERIES
+======================================
+
+These queries are written in ORACLE SQL style and are INTENTIONALLY
+designed to require conversion to PostgreSQL.
+
+Schemas used: BANKING, HRMS, SALES
+
+======================================================
+A) BANKING DOMAIN
+======================================================
+
+1) Top 10 accounts by transaction amount (last 60 days) with running total
+--------------------------------------------------------------------------
+WITH acct_txn AS (
+  SELECT a.account_id,
+         a.customer_id,
+         SUM(t.amount) AS total_amt
+  FROM banking.accounts a
+  JOIN banking.transactions t
+    ON t.account_id = a.account_id
+  WHERE t.txn_date >= TRUNC(SYSDATE) - 60
+  GROUP BY a.account_id, a.customer_id
+),
+ranked AS (
+  SELECT acct_txn.*,
+         SUM(total_amt) OVER () AS grand_total,
+         SUM(total_amt) OVER (ORDER BY total_amt DESC) AS running_total,
+         RANK() OVER (ORDER BY total_amt DESC) AS rnk
+  FROM acct_txn
+)
+SELECT account_id, customer_id, total_amt,
+       grand_total,
+       running_total,
+       ROUND(total_amt / grand_total * 100, 2) AS pct_of_total
+FROM ranked
+WHERE rnk <= 10
+ORDER BY total_amt DESC;
+
+
+2) Dormant accounts (no txn in 90 days) using old outer join (+)
+---------------------------------------------------------------
+SELECT a.account_id,
+       a.customer_id,
+       a.balance,
+       MAX(t.txn_date) AS last_txn_date
+FROM banking.accounts a,
+     banking.transactions t
+WHERE a.account_id = t.account_id(+)
+GROUP BY a.account_id, a.customer_id, a.balance
+HAVING MAX(t.txn_date) < TRUNC(SYSDATE) - 90 OR MAX(t.txn_date) IS NULL
+ORDER BY a.balance DESC;
+
+
+3) Monthly volume + best transaction day using KEEP
+---------------------------------------------------
+WITH d AS (
+  SELECT TRUNC(txn_date, 'MM') AS month_start,
+         TRUNC(txn_date) AS day,
+         COUNT(*) AS day_cnt,
+         SUM(amount) AS day_amt
+  FROM banking.transactions
+  GROUP BY TRUNC(txn_date, 'MM'), TRUNC(txn_date)
+),
+m AS (
+  SELECT month_start,
+         SUM(day_cnt) AS txn_count,
+         SUM(day_amt) AS txn_amount,
+         MAX(day) KEEP (DENSE_RANK LAST ORDER BY day_amt) AS best_day
+  FROM d
+  GROUP BY month_start
+)
+SELECT TO_CHAR(month_start, 'Mon YYYY') AS month_name,
+       txn_count,
+       txn_amount,
+       best_day
+FROM m
+ORDER BY month_start DESC;
+
+
+4) Hierarchical account structure using CONNECT BY
+--------------------------------------------------
+SELECT LPAD(' ', (LEVEL-1)*2) || account_id AS tree,
+       account_id,
+       customer_id,
+       balance,
+       LEVEL AS depth
+FROM banking.accounts
+START WITH parent_account_id IS NULL
+CONNECT BY PRIOR account_id = parent_account_id
+ORDER SIBLINGS BY account_id;
+
+
+======================================================
+B) HRMS DOMAIN
+======================================================
+
+5) Department-wise top & bottom earners using KEEP
+--------------------------------------------------
+SELECT department_id,
+       MAX(emp_name) KEEP (DENSE_RANK LAST ORDER BY salary) AS top_emp,
+       MAX(salary)   KEEP (DENSE_RANK LAST ORDER BY salary) AS top_sal,
+       MAX(emp_name) KEEP (DENSE_RANK FIRST ORDER BY salary) AS low_emp,
+       MIN(salary)   KEEP (DENSE_RANK FIRST ORDER BY salary) AS low_sal,
+       ( MAX(salary) KEEP (DENSE_RANK LAST ORDER BY salary)
+       - MIN(salary) KEEP (DENSE_RANK FIRST ORDER BY salary) ) AS gap
+FROM hrms.employees
+GROUP BY department_id
+ORDER BY gap DESC;
+
+
+6) Attendance streak detection using FETCH FIRST
+------------------------------------------------
+WITH x AS (
+  SELECT emp_id,
+         att_date,
+         att_date - ROW_NUMBER() OVER (PARTITION BY emp_id ORDER BY att_date) AS grp
+  FROM hrms.attendance
+),
+streaks AS (
+  SELECT emp_id,
+         MIN(att_date) AS start_date,
+         MAX(att_date) AS end_date,
+         COUNT(*) AS streak_len
+  FROM x
+  GROUP BY emp_id, grp
+)
+SELECT s.emp_id, e.emp_name, s.start_date, s.end_date, s.streak_len
+FROM streaks s
+JOIN hrms.employees e ON e.emp_id = s.emp_id
+ORDER BY s.streak_len DESC
+FETCH FIRST 20 ROWS ONLY;
+
+
+7) Salary banding using DECODE and SIGN
+--------------------------------------
+SELECT department_id,
+       COUNT(*) AS total_emps,
+       SUM(DECODE(SIGN(salary-100000), 1, 1, 0)) AS over_100k,
+       SUM(DECODE(SIGN(salary-50000),  1, 1, 0)) AS over_50k,
+       SUM(DECODE(salary, NULL, 1, 0)) AS null_salary
+FROM hrms.employees
+GROUP BY department_id
+ORDER BY total_emps DESC;
+
+
+======================================================
+C) SALES DOMAIN
+======================================================
+
+8) Product revenue PIVOT by month
+--------------------------------
+SELECT *
+FROM (
+  SELECT p.product_id,
+         p.product_name,
+         TO_CHAR(o.order_date, 'YYYY-MM') AS ym,
+         (oi.qty * p.price) AS revenue
+  FROM sales.orders o
+  JOIN sales.order_items oi ON oi.order_id = o.order_id
+  JOIN sales.products p     ON p.product_id = oi.product_id
+)
+PIVOT (
+  SUM(revenue)
+  FOR ym IN ('2025-10' AS OCT_2025, '2025-11' AS NOV_2025, '2025-12' AS DEC_2025)
+)
+ORDER BY product_id;
+
+
+9) 80/20 Pareto revenue analysis
+--------------------------------
+WITH rev AS (
+  SELECT p.product_id, p.product_name,
+         SUM(oi.qty * p.price) AS revenue
+  FROM sales.order_items oi
+  JOIN sales.products p ON p.product_id = oi.product_id
+  GROUP BY p.product_id, p.product_name
+),
+r AS (
+  SELECT rev.*,
+         SUM(revenue) OVER () AS total_rev,
+         SUM(revenue) OVER (ORDER BY revenue DESC) AS running_rev
+  FROM rev
+)
+SELECT *
+FROM r
+WHERE running_rev <= total_rev * 0.80
+ORDER BY revenue DESC;
+
+
+10) MERGE multiple rows from staging data
+----------------------------------------
+MERGE INTO sales.products p
+USING (
+  SELECT 101 AS product_id, 'Prod-101' AS product_name, 999 AS price FROM dual
+  UNION ALL
+  SELECT 102, 'Prod-102', 1999 FROM dual
+  UNION ALL
+  SELECT 103, 'Prod-103', 2999 FROM dual
+) s
+ON (p.product_id = s.product_id)
+WHEN MATCHED THEN
+  UPDATE SET p.product_name = s.product_name,
+             p.price = s.price
+WHEN NOT MATCHED THEN
+  INSERT (product_id, product_name, price)
+  VALUES (s.product_id, s.product_name, s.price);
+
+
+11) Top product per order using ROWNUM
+-------------------------------------
+SELECT *
+FROM (
+  SELECT o.order_id,
+         oi.product_id,
+         oi.qty,
+         ROW_NUMBER() OVER (PARTITION BY o.order_id ORDER BY oi.qty DESC) AS rn
+  FROM sales.orders o
+  JOIN sales.order_items oi ON oi.order_id = o.order_id
+)
+WHERE rn = 1
+  AND ROWNUM <= 50
+ORDER BY order_id;
+
+
+======================================================
+D) BONUS ORACLE-ONLY EXERCISES
+======================================================
+
+12) Month calendar using CONNECT BY
+----------------------------------
+SELECT ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -(LEVEL-1)) AS month_start
+FROM dual
+CONNECT BY LEVEL <= 12
+ORDER BY month_start DESC;
+
+
+13) Empty string vs NULL semantic trap
+-------------------------------------
+SELECT customer_id,
+       NVL(email, 'NO_EMAIL') AS email_fixed
+FROM banking.customers
+WHERE email = '';
+
+======================================================
+END OF FILE
+======================================================
